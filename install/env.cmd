@@ -8,13 +8,16 @@ python.exe -m pip install --upgrade pip
 
 pip3 install pyproj
 
-# Install other dependencies
+:: Install other dependencies
 pip3 install numpy shapely rtree pillow requests scikit-fmm
 
-#pip3 freeze > requirements.txt
-pip3 install pipreqs
+::python -c "import sys; print(sys.version); print(sys.maxsize > 2**32)"
+::pip3 install "D:\x-plane resources\ortho4xp_allinone\gdal-3.10.2-cp310-cp310-win_amd64.whl"
 
-pipreqs .
+::pip3 freeze > requirements.txt
+::pip3 install pipreqs
+::pipreqs .
 
+pip3 install requests
 
 
