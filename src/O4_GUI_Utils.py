@@ -39,6 +39,20 @@ import O4_Config_Utils as CFG
 OsX = "dar" in sys.platform
 
 ################################################################################
+def load_tile_cfg_into_settings(lat, lon, custom_build_dir):
+    """Load one tile's saved cfg into the live build settings, GUI-free.
+
+    Used both at launch (last visited tile) and when a tile is picked on the
+    map. Quiet by design: a missing cfg only costs a log line, never a dialog.
+    """
+    try:
+        if not CFG.load_tile_cfg_into_globals(lat, lon, str(custom_build_dir)):
+            UI.vprint(2, "No tile cfg found, keeping current settings.")
+    except Exception as e:
+        UI.vprint(2, e)
+
+
+################################################################################
 class Ortho4XP_GUI(tk.Tk):
 
     # Constants
@@ -373,6 +387,12 @@ class Ortho4XP_GUI(tk.Tk):
             self.default_website.set("BI")
             self.default_zl.set(16)
             self.custom_build_dir.set("")
+        # load the last visited tile's own cfg into the live build settings
+        lat_lon = self.get_lat_lon(check=False)
+        if lat_lon:
+            load_tile_cfg_into_settings(
+                lat_lon[0], lat_lon[1], self.custom_build_dir.get()
+            )
 
     # GUI methods
     def write(self, line):
@@ -1708,6 +1728,10 @@ class Ortho4XP_Earth_Preview(tk.Toplevel):
         )
         self.parent.lat.set(lat)
         self.parent.lon.set(lon)
+        # load this tile's own cfg into the live build settings
+        load_tile_cfg_into_settings(
+            lat, lon, self.parent.custom_build_dir.get()
+        )
         return
 
     def toggle_to_custom(self, event):

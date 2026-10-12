@@ -610,6 +610,25 @@ class Tile:
 
 
 ################################################################################
+def load_tile_cfg_into_globals(lat, lon, custom_build_dir):
+    """Push the saved cfg of one tile into the module globals.
+
+    Tile.__init__ copies those globals into its own attributes, so any tile
+    built afterwards inherits them. This is the same mechanism the config
+    window's "Load Tile Cfg" + "Apply" pair performs, without any GUI: the
+    single tile build path (TILE.build_all) does not read per tile cfg on its
+    own, only build_tile_list does when asked to.
+
+    Returns 1 if a cfg file was found and read, 0 otherwise. Variables absent
+    from the cfg file keep their current value.
+    """
+    tile = Tile(lat, lon, custom_build_dir)
+    if not tile.read_from_config():
+        return 0
+    for var in list_tile_vars:
+        globals()[var] = getattr(tile, var)
+    return 1
+
 
 ################################################################################
 class Ortho4XP_Config(tk.Toplevel):
