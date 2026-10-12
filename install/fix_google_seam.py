@@ -27,10 +27,13 @@ fix_google_seam.py — 修掉 Google(GO2) 影像拼接补丁留下的"黄条纹 
        编码流程即可（而且比改 DDS 少一次 DXT 压缩损失）。
 
 块名 → 经纬度
-    文件名 <y>_<x>_GO2<zl>.jpg / .dds：x = ZL19 全局瓦片列号 - 128（y 同理）。
-    已用 +27+089 的 cfg zone_list 校验（x=392304 → lon 89.461669921875）。
-    jpg 与 dds 同名同网格（Ortho4XP 的 jpeg_file_name_from_attributes 用的是同一组
-    til_x_left/til_y_top），所以两种输入都能直接算经纬度。
+    文件名 <y>_<x>_<provider><zl>.jpg/.dds 里的 y/x **就是该 zoom 下的瓦片号（无偏移）**，
+    一个 4096px 块 = 16 个瓦片。所以 lon_left = x / 2**zl * 360 - 180，
+    lat 用 Mercator 反算，分辨率 = 156543.03392 * cos(lat) / 2**zl。
+    同一个 textures 目录里常常混着多个 zoom（+27+089 实测有 ZL13/15/16/17/18/19），
+    所以必须按文件名里的 zoom 换算，不能写死 ZL19——否则 ZL18 的块会被算成 2 倍宽。
+    校验方式：该切片的 cfg zone_list 里一条 zone 矩形恰好等于一个 4096 块，
+    183 个文件（ZL15..19）在"偏移 0"下 100% 命中 zone 角点。
 
 位置与运行
     本脚本放在 Ortho4XP/install/ 下，独立运行：不需要设置环境变量，nvcompress 会自动
@@ -39,17 +42,30 @@ fix_google_seam.py — 修掉 Google(GO2) 影像拼接补丁留下的"黄条纹 
     依赖只有 pillow + numpy（Ortho4XP 自己就用这两个），所以用跑 Ortho4XP 的同一个
     解释器即可；脚本不做任何联网操作。
 
+自动扫描（推荐用法）
+    给一个目录，它自己干三件事：
+      1. 逐块找"贯穿全高、方向一致的竖直台阶"（检测在 1/4 缩图上做，jpg 走缩解码）；
+      2. 把各块命中的台阶按**绝对经度**聚组：真正的 Google 补丁边界会横跨多块，
+         在同一经线上被多个块同时命中 -> 才算"确认条纹"；
+      3. 对确认的组自动估 LUT 并修掉它影响的每个块（含西侧衰减范围内的块，保证
+         跨块连续），其余文件不动。
+    单块命中的一律只列进"疑似"清单不自动修：实测云影/地物边界单块也能有 40+ 灰阶
+    的近垂直台阶，靠单块统计与拼接缝区分不开，只有跨块支撑靠得住。
+
 用法（在 Ortho4XP 根目录下执行）
-    # 只看效果：输出前后对比预览，不动文件（jpg/dds 都能读）
+    # 只扫描列出（不改文件）：哪些块有条纹、在哪一列、多少灰阶、几块支撑
+    python3 install/fix_google_seam.py --dir ".../zOrtho4XP_+27+089/textures" --scan
+
+    # 扫描 + 自动修（--out-dir 换目录；不给则原地并留 .bak）
+    python3 install/fix_google_seam.py --dir ".../Orthophotos/+27+089/GO2_19" --recursive \
+        --write --out-dir /tmp/fixed
+
+    # 单文件预览（jpg/dds 都能读，不动文件）
     python3 install/fix_google_seam.py --in 220544_392304_GO219.jpg --strength 0.7 \
         --preview /tmp/p.png
 
-    # 改源 jpg：扩展名/格式不变，同名写回（--out-dir 换目录，不给则原地并留 .bak）
-    python3 install/fix_google_seam.py --dir Orthophotos/+27+089/GO2_19 --recursive \
-        --seam-lon 89.46398 --strength 0.7 --write --out-dir /tmp/fixed
-
-    # 改 DDS（原地或换目录），编码仍走 Ortho4XP 同一条 nvcompress -bc1
-    python3 install/fix_google_seam.py --in 220544_392304_GO219.dds --strength 0.7 --write
+    # 手工指定接缝经度（自动分组挑错时用；从 --scan 的输出里抄经度）
+    python3 install/fix_google_seam.py --dir ... --seam-lon 89.3760967 --write
 
     # 只羽化、不改颜色（把硬线摊成宽带渐变）
     python3 install/fix_google_seam.py --in x.jpg --mode identity --ramp-m 400
@@ -92,8 +108,6 @@ except ImportError as exc:
              "（macOS 自带 python3 是 Xcode/LibreSSL 版，直接 pip install 常失败，所以先建 venv）"
              % (exc.name, os.path.basename(__file__)))
 
-ZL19_N = 2 ** 19
-NAME_OFFSET = 128          # 块名 = ZL19 全局瓦片号 - 128（已在 +27+089 上校验）
 IMG_EXT = (".jpg", ".jpeg", ".png", ".dds", ".tif", ".tiff", ".bmp")
 
 
@@ -144,9 +158,29 @@ def resolve_nvcompress(user_path=None):
 
 
 # ---------------------------------------------------------------- I/O helpers
-def load_rgb(path):
+def load_rgb(path, draft=None):
+    """draft：给 jpg 时用 DCT 缩解码（1/4 尺寸直接解出，检测阶段用，快约一个数量级）。"""
     with Image.open(path) as im:
+        if draft:
+            im.draft("RGB", (int(draft), int(draft)))
         return np.asarray(im.convert("RGB")).astype(np.float32)
+
+
+def load_rgb_detect(path, target=1024):
+    """检测专用的小图；返回 (小图, step)，小图坐标 × step = 原图坐标。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        with Image.open(path) as im:
+            w0 = im.size[0]
+            im.draft("RGB", (int(target), int(target)))
+            arr = np.asarray(im.convert("RGB")).astype(np.float32)
+        step = (w0 / float(arr.shape[1])) if arr.shape[1] else 1.0
+    else:
+        arr = load_rgb(path)
+        step = max(1, int(round(arr.shape[1] / float(target))))
+        if step > 1:
+            arr = arr[::step, ::step]
+    return arr, float(step)
 
 
 def write_dds(rgb_u8, out_path, nvcompress=None, fast=False):
@@ -180,17 +214,21 @@ def save_like(rgb_u8, out_path, jpeg_quality=95, nvcompress=None, fast=False):
 
 
 # ------------------------------------------------------------ geo / geometry
-def name_to_xy(path):
-    m = re.match(r"(\d+)_(\d+)_", os.path.basename(path))
-    return (int(m.group(1)) + NAME_OFFSET, int(m.group(2)) + NAME_OFFSET) if m else None
+NAME_RE = re.compile(r"^(\d+)_(\d+)_[A-Za-z0-9]*?(\d{2})$")
 
 
-def x_to_lon(x_zl19):
-    return x_zl19 / ZL19_N * 360.0 - 180.0
+def parse_name(path):
+    """<y>_<x>_<provider><zl>.{jpg,dds} -> (y, x, zl)；不合规范返回 None。"""
+    m = NAME_RE.match(os.path.splitext(os.path.basename(path))[0])
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
-def y_to_lat(y_zl19):
-    return math.degrees(math.atan(math.sinh(math.pi * (1 - 2.0 * y_zl19 / ZL19_N))))
+def x_to_lon(x, zl):
+    return x / float(2 ** zl) * 360.0 - 180.0
+
+
+def y_to_lat(y, zl):
+    return math.degrees(math.atan(math.sinh(math.pi * (1 - 2.0 * y / 2 ** zl))))
 
 
 def m_per_deg_lon(lat):
@@ -198,15 +236,22 @@ def m_per_deg_lon(lat):
 
 
 def block_geo(path, size=4096):
-    xy = name_to_xy(path)
-    if xy is None:
+    """块的地理范围 + 分辨率。**必须按文件名的 zoom 换算**（同一目录常混 ZL13..19）。
+
+    命名规则 = 该 zoom 下的瓦片号（无偏移）+ 4096px 块 = 16 个瓦片。
+    已用 +27+089 的 cfg zone_list 校验：一条 zone 矩形正好等于一个 4096 块，
+    183 个文件（ZL15..19）在偏移 0 下 100% 命中 zone 角点，偏移 128 只是偶合。
+    """
+    p = parse_name(path)
+    if p is None:
         return None
-    y0, x0 = xy
-    lat_top, lat_bot = y_to_lat(y0), y_to_lat(y0 + 16)
-    return dict(lon_left=x_to_lon(x0), lon_right=x_to_lon(x0 + 16),
+    y0, x0, zl = p
+    lat_top, lat_bot = y_to_lat(y0, zl), y_to_lat(y0 + 16, zl)
+    lon_left, lon_right = x_to_lon(x0, zl), x_to_lon(x0 + 16, zl)
+    return dict(zl=zl, lon_left=lon_left, lon_right=lon_right,
                 lat_top=lat_top, lat_bot=lat_bot,
-                m_per_px=156543.03392 * math.cos(math.radians((lat_top + lat_bot) / 2)) / ZL19_N,
-                px_per_deg=size / (x_to_lon(x0 + 16) - x_to_lon(x0)))
+                m_per_px=156543.03392 * math.cos(math.radians((lat_top + lat_bot) / 2)) / 2 ** zl,
+                px_per_deg=size / (lon_right - lon_left))
 
 
 def px_to_lon(path, x_px, size=4096):
@@ -219,28 +264,75 @@ def lon_to_px(path, lon, size=4096):
     return (lon - g["lon_left"]) * g["px_per_deg"]
 
 
-# ------------------------------------------------------------ seam detection
+# ------------------------------------------------- 条纹检测（贯穿全高的竖直台阶）
 def column_rg(img):
     cm = img.mean(axis=0)
     return cm[:, 0] - cm[:, 1]
 
 
-def find_seam(img, min_step=6.0, plateau=192, margin=256, win=101):
-    """返回 (seam_x, warm_side)；找不到则 (None, None)。"""
-    rg = column_rg(img)
-    k = np.ones(win) / win
-    sm = np.convolve(np.pad(rg, (win // 2, win // 2), mode="edge"), k, "valid")
-    best, best_x = 0.0, None
-    for x in range(margin, len(rg) - margin):
-        l = sm[x - plateau:x - plateau // 2].mean()
-        r = sm[x + plateau // 2:x + plateau].mean()
-        if abs(r - l) > best:
-            best, best_x = abs(r - l), x
-    if best_x is None or best < min_step:
-        return None, None
-    l = sm[best_x - plateau:best_x - plateau // 2].mean()
-    r = sm[best_x + plateau // 2:best_x + plateau].mean()
-    return best_x, ("left" if l > r else "right")
+def band_step_map(img, band_rows=256, p_lo=48, p_hi=144, sig="rg"):
+    """(n_bands, w)：每带、每列的"右侧 plateau 均值 - 左侧 plateau 均值"。O(w)/带。"""
+    h, w, _ = img.shape
+    n = max(1, (h + band_rows - 1) // band_rows)
+    out = np.zeros((n, w), dtype=np.float32)
+    x = np.arange(w)
+    for i in range(n):
+        y0, y1 = i * band_rows, min(h, (i + 1) * band_rows)
+        if y1 <= y0:
+            continue
+        m = img[y0:y1].mean(axis=0)
+        s = (m[:, 0] - m[:, 1]) if sig == "rg" else m.mean(axis=1)
+        cs = np.concatenate([[0.0], np.cumsum(s, dtype=np.float64)])
+
+        def rmean(off):
+            a = np.clip(x + off[0], 0, w)
+            b = np.clip(x + off[1], 0, w)
+            return (cs[b] - cs[a]) / np.maximum(b - a, 1)
+
+        out[i] = rmean((p_lo, p_hi)) - rmean((-p_hi, -p_lo))
+    return out
+
+
+def detect_stripes(img, band_rows=256, min_step=6.0, p_lo=48, p_hi=144, nms=200,
+                   edge=200, cohere=0.5):
+    """找"贯穿全高、方向一致"的竖直色调台阶（= 影像拼接缝 / 云影边界 / 地物边）。
+
+    判据不是"某处有台阶"，而是"每一带在同一个 x 上都有同向台阶"：
+      纵向取中位数 -> 只在少数带出现的地物边缘（河、田埂）被压掉；
+      同向带占比 -> 进一步惩罚左右来回跳的噪声。
+    分别在 R-G（色偏）和亮度上跑，谁强用谁。
+
+    **注意**：单块图像上，Google 补丁边界和云影边界几乎无法区分（实测云影台阶
+    可达 43 灰阶、同样是近垂直的硬边）。所以这里只负责"找出竖直台阶"，
+    "是不是真的拼接缝"由 group_stripes 的跨块支撑（同一经度多块命中）来定。
+
+    返回 [(x, severity, side, sig, rg_step)]，severity = |中位数台阶| × 同向性系数。
+    side = 需要被校正的一侧（rg: 偏暖的一侧；y: 偏亮的一侧）。
+    """
+    h, w, _ = img.shape
+    meds = {}
+    agrees = {}
+    for sig in ("rg", "y"):
+        S = band_step_map(img, band_rows, p_lo, p_hi, sig)
+        meds[sig] = np.median(S, axis=0)
+        agrees[sig] = np.abs(np.mean(np.sign(np.where(np.abs(S) > 3.0, S, 0)), axis=0))
+    cands = []
+    for sig in ("rg", "y"):
+        med, agree = meds[sig], agrees[sig]
+        score = np.abs(med) * np.clip((agree - cohere) / (1.0 - cohere), 0, 1)
+        for x in range(edge, w - edge):
+            s = float(score[x])
+            if s < min_step:
+                continue
+            if score[max(0, x - nms):x + nms].max() > s:      # 非极大值抑制
+                continue
+            cands.append((x, s, "left" if med[x] < 0 else "right", sig, float(meds["rg"][x])))
+    cands.sort(key=lambda t: -t[1])
+    kept = []
+    for c in cands:
+        if all(abs(c[0] - k[0]) > nms for k in kept):        # rg/y 同一位置只留强者
+            kept.append(c)
+    return kept
 
 
 def step_across(img, x_px, back=24, ahead=96):
@@ -336,68 +428,161 @@ def make_preview(before, after, seam_x, path, crop=1600, out_w=780):
 
 
 # ------------------------------------------------------------------- pipeline
-def find_seam_candidates(img, min_step=6.0, plateau=192, margin=256, win=101, nms=160):
-    """找所有"持续台阶"候选：返回 [(x, step, warm_side), ...]，按 |step| 降序。
+SCAN_TARGET = 1024         # 检测用小图的目标边长（jpg 缩解码；dds 解码后抽样）
 
-    只取"连续性"台阶（左右 plateau 均值差），并用非极大值抑制避免同一台阶重复。
+
+def scan_files(files, band=256, samples=420, min_step=6.0, target=SCAN_TARGET, quiet=False):
+    """逐文件检测条纹。返回 [(file, cands)]，cands = [(x_full, sev, side, sig)]。
+
+    检测在 1/4 小图上做（窗口/分带同步缩放），所以扫几百个块也还能忍。
     """
-    rg = column_rg(img)
-    k = np.ones(win) / win
-    sm = np.convolve(np.pad(rg, (win // 2, win // 2), mode="edge"), k, "valid")
-    cands = []
-    for x in range(margin, len(rg) - margin):
-        l = sm[x - plateau:x - plateau // 2].mean()
-        r = sm[x + plateau // 2:x + plateau].mean()
-        if abs(r - l) >= min_step:
-            cands.append((x, float(r - l)))
-    cands.sort(key=lambda t: -abs(t[1]))
+    res = []
+    for f in files:
+        try:
+            small, step = load_rgb_detect(f, target)
+        except Exception as exc:
+            if not quiet:
+                print("  ! %s 读取失败：%s" % (os.path.basename(f), exc))
+            res.append((f, []))
+            continue
+        scale = 1.0 / step
+        cands = detect_stripes(small,
+                               band_rows=max(16, int(round(band * scale))),
+                               min_step=min_step,
+                               p_lo=max(6, int(round(48 * scale))),
+                               p_hi=max(12, int(round(144 * scale))),
+                               nms=max(24, int(round(200 * scale))),
+                               edge=max(24, int(round(200 * scale))))
+        res.append((f, [(int(round(x * step)), sev, side, sig, rg)
+                        for x, sev, side, sig, rg in cands]))
+    return res
+
+
+def group_stripes(scanned, tol_px=250):
+    """把各块里"同一经度"的条纹聚成组——一个 Google 补丁边界往往横跨多块。
+
+    support（有多少个不同块在同一经度上命中）是**唯一可靠的判据**：
+    实测云影/地物边界单块也能有 40+ 灰阶的近垂直台阶，靠单块统计分不开。
+    返回 [dict]：lon, side, support, severity, ref, x_ref, sig, rg_step, members
+    按 severity 降序。
+    """
+    votes = []                                      # (lon, sev, side, sig, file, x, rg)
+    for f, cands in scanned:
+        g = block_geo(f)
+        if g is None:
+            continue
+        for x, sev, side, sig, rg in cands:
+            votes.append((px_to_lon(f, x), sev, side, sig, f, x, rg))
+    if not votes:
+        return []
+    lat = (block_geo(votes[0][4])["lat_top"] + block_geo(votes[0][4])["lat_bot"]) / 2
+    tol_deg = tol_px * 0.265 / m_per_deg_lon(lat)
+    votes.sort(key=lambda t: t[0])
+    groups = []
+    for i in range(len(votes)):
+        lo = votes[i][0]
+        grp = [v for v in votes[i:] if v[0] - lo <= tol_deg]
+        if not grp:
+            continue
+        # 同组里可能混了不同 lon 中心的候选，取被最多块支撑的那个子簇
+        sides = [v[2] for v in grp]
+        side = max(set(sides), key=sides.count)
+        grp = [v for v in grp if v[2] == side]
+        top = max(grp, key=lambda t: t[1])
+        groups.append(dict(lon=float(np.median([v[0] for v in grp])), side=side,
+                           support=len({v[4] for v in grp}), severity=top[1],
+                           ref=top[4], x_ref=top[5], sig=top[3], rg_step=top[6],
+                           members=grp))
+    # 合并同一条线（组中心相近的取 severity 高的）
+    groups.sort(key=lambda d: -d["severity"])
     kept = []
-    for x, step in cands:
-        if all(abs(x - kx) > nms for kx, _, _ in kept):
-            kept.append((x, step, "left" if step < 0 else "right"))
+    for d in groups:
+        if all(abs(d["lon"] - k["lon"]) > tol_deg for k in kept):
+            kept.append(d)
     return kept
 
 
-def detect_seam_lon(files, max_files=6, tol_px=200, min_step=6.0):
-    """跨文件聚合：真正的补丁接缝在多个块里出现在**同一经度**上。
+def plan_group(groups, args, files=None):
+    """给每个组算出：参考块、逐带锚点、每带 LUT。
 
-    返回 (ref_file, seam_x_in_ref, warm_side, lon_seam, 支撑数) 或 (None,)*5
+    两道保险，都是实测踩出来的：
+      · 参考块只用"该组里 zoom 最高"的块——ZL13/15/16 填充块一个像素几米到十几米、
+        窗口覆盖好几公里，估出来的 LUT 跟全分辨率块完全不是一回事（实测 ZL15 会把
+        中灰 +45 灰阶并顶到 255 截断）。
+      · 块内"接缝"游走 > max_wander_m，或校正量 > max_lut_shift 灰阶，都判为不像
+        拼接线（更像云影/地物边），只警告不修。
     """
-    votes = []                       # (lon, step, side, file, x)
-    for f in files[:max_files]:
-        try:
-            img = load_rgb(f)
-        except Exception:
+    plan = []
+    for d in groups:
+        cands = [d["ref"]] if d.get("ref") else [f for f in (files or []) if block_geo(f)]
+        zs = [(block_geo(f) or {}).get("zl", 0) for f in cands]
+        if zs:
+            cands = [f for f, z in zip(cands, zs) if z == max(zs)]      # 只留最高 zoom
+        pick = pick_reference(cands, d["lon"], args.band, args.search_px)
+        if pick is None:
             continue
-        for x, step, side in find_seam_candidates(img, min_step=min_step):
-            g = block_geo(f, img.shape[1])
-            votes.append((px_to_lon(f, x, img.shape[1]), abs(step), side, f, x))
-    if not votes:
-        return None, None, None, None, 0
-    g0 = block_geo(files[0])
-    tol_deg = tol_px / g0["px_per_deg"]
-    votes.sort()
-    best = None
-    for i in range(len(votes)):
-        lo = votes[i][0]
-        grp = []
-        for j in range(i, len(votes)):
-            if votes[j][0] - lo <= tol_deg:
-                grp.append(votes[j])
+        ref, seed, ref_rows, side, score = pick
+        if score < 3.0:
+            print("  警告：参考块 %s 上这条接缝只有 %.1f 灰阶，可能是误检，跳过"
+                  % (os.path.basename(ref), score))
+            continue
+        g_ref = block_geo(ref)
+        mpx = g_ref["m_per_px"] if g_ref else 0.265
+        wander_m = float(np.ptp(ref_rows)) * mpx
+        if wander_m > args.max_wander_m:
+            print("  警告：参考块 %s 里的\"接缝\"块内游走 %.0f m（> %.0f m），不像拼接线"
+                  "（更像云影/地物边界），跳过不修"
+                  % (os.path.basename(ref), wander_m, args.max_wander_m))
+            continue
+        img_ref = load_rgb(ref)
+        q_warm, q_cool = band_anchors(img_ref, ref_rows, side, args.band, args.samples)
+        luts = []
+        for i in range(len(q_warm)):
+            if args.mode == "identity":
+                luts.append(None)
+            elif args.mode == "offset":
+                luts.append(offset_lut(q_warm[i][1], q_cool[i][1], args.strength))
             else:
-                break
-        if not grp:
+                luts.append(quantile_lut(q_warm[i], q_cool[i],
+                                         args.strength, args.slope_min, args.slope_max))
+        shift = 0.0
+        for k in (0, len(luts) // 2, len(luts) - 1):
+            if luts[k] is None:
+                continue
+            for v in (32, 96, 160, 224):
+                shift = max(shift, max(abs(float(luts[k][v][c]) - v) for c in range(3)))
+        if shift > args.max_lut_shift:
+            # 只是提示，不拦：实测真实接缝的逐带校正量能到 70+ 灰阶（中带 12、中位 31），
+            # 因为它是"分位对分位"匹配、还要乘权重（实际生效量 ~1/3），幅度大不等于错。
+            print("  注意：参考块 %s 某带校正量到 %.0f 灰阶（超过提示阈值 %.0f）；"
+                  "实际生效量会乘权重，先看 --preview 再决定。"
+                  % (os.path.basename(ref), shift, args.max_lut_shift))
+        plan.append(dict(lon=d["lon"], side=side, ref=ref, ref_x=int(np.median(ref_rows)),
+                         score=score, support=d["support"], severity=d["severity"],
+                         sig=d["sig"], luts=luts, q_warm=q_warm, q_cool=q_cool,
+                         wander=float(np.ptp(ref_rows)), wander_m=wander_m,
+                         m_per_px=mpx))
+    return plan
+
+
+def groups_for_file(f, plan, reach_m, lat):
+    """某个块要挨哪几刀（可能不止一条补丁边界）。
+
+    受影响 = 块含这条经线，或块在它的西侧且东缘到它的距离 < reach（= full_m + ramp_m）。
+    东侧的块权重恒为 0，一律不动。
+    """
+    g = block_geo(f, 4096)
+    if g is None:
+        return []
+    out = []
+    for p in plan:
+        if g["lon_left"] <= p["lon"] <= g["lon_right"]:
+            out.append(p)                                  # 线穿过这个块
             continue
-        files_in = len({t[3] for t in grp})
-        score = files_in * sum(t[1] for t in grp) / len(grp)
-        if best is None or score > best[0]:
-            best = (score, grp)
-    grp = best[1]
-    ref_lon = float(np.mean([t[0] for t in grp]))
-    top = max(grp, key=lambda t: t[1])
-    sides = [t[2] for t in grp]
-    side = max(set(sides), key=sides.count)
-    return top[3], top[4], side, ref_lon, len({t[3] for t in grp})
+        d_east_m = (p["lon"] - g["lon_right"]) * m_per_deg_lon(lat)   # >0: 块在接缝以西
+        if 0.0 < d_east_m < reach_m:
+            out.append(p)                                  # 块在西侧、且在衰减范围内
+    return out
 
 
 def track_seam(img, seed_x, search=300, band_rows=256, p_lo=48, p_hi=144, win=31,
@@ -482,22 +667,90 @@ def fmt(v):
     return "—" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else "%.1f" % v
 
 
+def apply_group_to_image(img, f, p, args):
+    """把一条补丁边界的校正叠加到 img 上，返回 (out, weight, contains, seed)。
+
+    权重以"逐带跟踪到的接缝线"为界硬切（几米抗锯齿），距离按米算 -> 跨块连续。
+    """
+    h, w, _ = img.shape
+    gg = block_geo(f, w)
+    if gg is None:                        # 文件名不合 Ortho4XP 规范，换不出经纬度
+        return img, np.zeros((h, w), dtype=np.float32), False, 0.0
+    m_per_px = gg["m_per_px"]
+    seed = lon_to_px(f, p["lon"], w)
+    contains = -64 <= seed <= w + 64
+    if contains:
+        seam_bands = track_seam(img, seed, search=args.search_px, band_rows=args.band)
+        centres = (np.arange(len(seam_bands)) + 0.5) * args.band
+        seam_rows = np.interp(np.arange(h), centres, seam_bands).astype(np.float32)
+        dist_px = seam_rows[:, None] - np.arange(w, dtype=np.float32)[None, :]
+    else:
+        lons = gg["lon_left"] + np.arange(w, dtype=np.float32) / gg["px_per_deg"]
+        dist_px = np.broadcast_to(((p["lon"] - lons) * gg["px_per_deg"])[None, :], (h, w)).copy()
+
+    full_px = args.full_m / m_per_px
+    ramp_px = args.ramp_m / m_per_px
+    aa_px = max(2.0, args.aa_m / m_per_px)
+    weight = np.clip(np.where(dist_px > full_px,
+                              np.clip((full_px + ramp_px - dist_px) / ramp_px, 0, 1),
+                              1.0), 0, 1)
+    weight = np.where(dist_px < 0.0, 0.0, weight)              # 另一侧完全不动
+    weight = np.where(np.abs(dist_px) < aa_px,                 # 接缝几米抗锯齿
+                      np.clip(0.5 + dist_px / (2 * aa_px), 0, 1), weight).astype(np.float32)
+    if p["side"] == "right":
+        weight = 1.0 - weight
+
+    if args.mode == "identity":
+        r_px = int(max(8, round(2 * args.ramp_m / m_per_px)))
+        band = np.abs(np.asarray(dist_px, dtype=np.float32)) < ramp_px
+        out = img
+        if band.any():
+            box = np.ones(r_px) / r_px
+            sm = np.empty_like(img)
+            for c in range(3):
+                sm[:, :, c] = np.apply_along_axis(
+                    lambda r: np.convolve(np.pad(r, (r_px // 2, r_px // 2), mode="edge"), box, "valid"),
+                    1, img[:, :, c])
+            out = np.where(band[:, :, None], sm, img)
+    else:
+        corrected = apply_lut_rows(img, p["luts"], args.band)
+        out = img * (1.0 - weight[:, :, None]) + corrected * weight[:, :, None]
+    return out, weight, contains, seed
+
+
+def fmt_side(s):
+    return "西侧" if s == "left" else "东侧"
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="扫描并修掉 Google(GO2) 影像拼接造成的竖直黄条纹 / 色调台阶")
     ap.add_argument("--in", dest="single")
     ap.add_argument("--dir", dest="folder")
     ap.add_argument("--pattern", default="*_GO2*", help="默认同时匹配 jpg/dds")
     ap.add_argument("--recursive", action="store_true", help="在 --dir 下递归查找（Orthophotos 子目录）")
+    ap.add_argument("--scan", action="store_true",
+                    help="只扫描列出条纹文件，不改动任何文件（优先于 --write）")
     ap.add_argument("--seam-x", default="auto")
-    ap.add_argument("--seam-lon", type=float, default=None)
+    ap.add_argument("--seam-lon", type=float, default=None, help="手工指定接缝经度（跳过自动分组）")
     ap.add_argument("--strength", type=float, default=0.7)
     ap.add_argument("--mode", choices=["match", "offset", "identity"], default="match")
     ap.add_argument("--band", type=int, default=256, help="分带行数")
     ap.add_argument("--full-m", type=float, default=250.0, help="接缝以西多少米内保持 100%% 校正")
     ap.add_argument("--ramp-m", type=float, default=700.0, help="再往西多少米内把校正量渐变到 0")
-    ap.add_argument("--feather-m", type=float, default=8.0, help="接缝处抗锯齿过渡宽度(米)")
+    ap.add_argument("--feather-m", type=float, default=8.0, help="保留参数（等价于 --aa-m）")
     ap.add_argument("--samples", type=int, default=420, help="接缝两侧取样窗宽(px)")
-    ap.add_argument("--min-step", type=float, default=6.0, help="判定接缝的最小 R-G 台阶（灰阶）")
+    ap.add_argument("--min-step", type=float, default=6.0,
+                    help="判定条纹的最小台阶（灰阶）；扫描和报告都用它")
+    ap.add_argument("--group-px", type=int, default=250, help="同一经线的聚组容差(px)")
+    ap.add_argument("--min-support", type=int, default=2,
+                    help="列为\"确认条纹\"所需的最少块数支撑（1 块的疑似只报告不修）")
+    ap.add_argument("--fix-min-support", type=int, default=3,
+                    help="自动修复所需的最少块数支撑；比列表阈值更严，避免把长的云影边界当接缝改掉")
+    ap.add_argument("--max-wander-m", type=float, default=400.0,
+                    help="参考块内接缝游走上限(米)；超过判定为云影/地物边，不修")
+    ap.add_argument("--max-lut-shift", type=float, default=60.0,
+                    help="校正量提示阈值(灰阶)；超过只提示不拦（真实接缝也能到 70+）")
     ap.add_argument("--search-px", type=int, default=300, help="逐带跟踪接缝时的搜索半径(px)")
     ap.add_argument("--aa-m", type=float, default=2.0, help="接缝处分界抗锯齿宽度(米)")
     ap.add_argument("--slope-min", type=float, default=0.35)
@@ -522,161 +775,158 @@ def main():
                        if os.path.splitext(f)[1].lower() in IMG_EXT and not f.endswith(".bak"))
     if not files:
         sys.exit("no input files")
-
     if args.write_dds and any(os.path.splitext(f)[1].lower() == ".dds" for f in files):
         print("nvcompress : %s" % resolve_nvcompress(args.nvcompress))
     exts = sorted({os.path.splitext(f)[1].lower() for f in files})
     print("输入       : %d 个文件，格式 %s（输出保持同扩展名）" % (len(files), "/".join(exts)))
 
-    # ---- 1. 接缝：定经度 -> 在含这条线的块里挑对比度最强的那块做参考 ----
-    ref = seam_x = None
-    warm_side = "left"
-    support = 0
-    ref_rows = None
+    geo0 = block_geo(next((f for f in files if block_geo(f)), files[0]))
+    lat_mid = (geo0["lat_top"] + geo0["lat_bot"]) / 2
+
+    # ---- 1. 扫描：逐文件找"贯穿全高"的竖直台阶 ----
+    print("\n== 扫描条纹（阈值 %.1f 灰阶，检测在 1/4 缩图上做）==" % args.min_step)
+    scanned = scan_files(files, band=args.band, min_step=args.min_step)
+    geo_cache = {f: block_geo(f) for f, _ in scanned}
+
+    # 分组要在报告之前做：是否"真条纹"由跨块支撑决定，不是单块的自评分
     if args.seam_lon is not None:
-        lon_seam = args.seam_lon
-        if not any(block_geo(f) and block_geo(f)["lon_left"] <= lon_seam <= block_geo(f)["lon_right"]
-                   for f in files):
-            sys.exit("--seam-lon 不落在任何输入块内")
-    elif args.seam_x != "auto" and len(files) == 1:
-        img = load_rgb(files[0])
-        ref, seam_x = files[0], int(args.seam_x)
-        rg = column_rg(img)
-        warm_side = "left" if rg[:seam_x].mean() > rg[seam_x:].mean() else "right"
-        lon_seam = px_to_lon(ref, seam_x)
+        groups = [dict(lon=args.seam_lon, side="left", support=0, severity=0.0,
+                       ref=None, x_ref=0, sig="手工", rg_step=0.0, members=[])]
     else:
-        r0, x0, side0, lon0, support = detect_seam_lon(files, min_step=args.min_step)
-        if r0 is None:
-            sys.exit("未检测到接缝；用 --seam-x / --seam-lon 手工指定")
-        lon_seam = lon0
+        groups = group_stripes(scanned, tol_px=args.group_px)
+    live = [d for d in groups if args.seam_lon is not None or d["support"] >= args.min_support]
 
-    if ref is None:
-        pick = pick_reference(files, lon_seam, args.band, args.search_px)
-        if pick is None:
-            sys.exit("没有任何块包含这条经线")
-        ref, seam_x, ref_rows, warm_side, score = pick
-        print("参考块挑选用对比度 %.1f 灰阶衡量" % score)
-        if score < 3.0:
-            print("警告：参考块里这条接缝的对比度很低，可能这条经线在这里并不是真正的补丁边界")
+    def confirmed_lon(f, x):
+        """这条候选落在某个"被多块支撑"的经线上吗？"""
+        g = geo_cache.get(f)
+        if g is None:
+            return None
+        lat_m = (g["lat_top"] + g["lat_bot"]) / 2
+        for d in live:
+            if abs(px_to_lon(f, x) - d["lon"]) * m_per_deg_lon(lat_m) < 200:
+                return d
+        return None
 
-    g = block_geo(ref)
-    lat_mid = (g["lat_top"] + g["lat_bot"]) / 2
-    if args.seam_lon is None:
-        lon_seam = px_to_lon(ref, seam_x)
-    print("参考块    : %s  %s" % (os.path.basename(ref),
-                                ("（%d 个块在同一经度上支撑这条接缝）" % support) if support else ""))
-    print("接缝      : x=%d px -> lon=%.7f   (lat≈%.4f, %.3f m/px)"
-          % (seam_x, lon_seam, lat_mid, g["m_per_px"]))
-    print("偏黄一侧  : %s" % ("西侧" if warm_side == "left" else "东侧"))
+    confirmed, suspect = [], []
+    for f, cands in scanned:
+        for c in cands:
+            (confirmed if confirmed_lon(f, c[0]) else suspect).append((f, c))
 
-    # ---- 2. 参考块的逐带接缝位置 + 分带锚点 ----
-    img_ref = load_rgb(ref)
-    seed_ref = lon_to_px(ref, lon_seam, img_ref.shape[1])
-    if ref_rows is None:
-        if -64 <= seed_ref <= img_ref.shape[1] + 64:
-            ref_rows = track_seam(img_ref, seed_ref, search=args.search_px, band_rows=args.band)
-        else:
-            ref_rows = np.full((img_ref.shape[0] + args.band - 1) // args.band, seed_ref, dtype=np.float32)
-    spread = float(np.ptp(ref_rows))
-    seam_x = int(np.median(ref_rows))          # 报一个代表性位置
-    q_warm, q_cool = band_anchors(img_ref, ref_rows, warm_side, args.band, args.samples)
-    print("分带      : %d 带 x %d 行，锚点已沿纬度平滑；接缝在块内游走 %.0f px (%.0f m)"
-          % (len(q_warm), args.band, spread, spread * g["m_per_px"]))
-    print("黄侧 带0 p10/50/90: %s" % np.round(q_warm[0], 0).tolist())
-    print("绿侧 带0 p10/50/90: %s" % np.round(q_cool[0], 0).tolist())
+    def show(rows, tag):
+        if not rows:
+            return
+        print("\n%s %d 处：" % (tag, len(rows)))
+        print("  强度   文件                                 位置           经度           校正侧  信号  R-G台阶  支撑")
+        for f, (x, sev, side, sig, rg) in sorted(rows, key=lambda t: -t[1][1]):
+            g = geo_cache.get(f)
+            d = confirmed_lon(f, x)
+            sup = ("%d 块" % d["support"]) if (d and d["support"]) else ""
+            mp = g["m_per_px"] if g else 0.0
+            print("  %5.1f  %-34s x=%-5d %5.0fm  %.7f   %s    %-3s  %+6.1f   %s"
+                  % (sev, os.path.basename(f), x, x * mp,
+                     px_to_lon(f, x) if g else float("nan"),
+                     fmt_side(side), sig, rg, sup))
 
-    luts = []
-    for i in range(len(q_warm)):
-        if args.mode == "identity":
-            luts.append(None)
-        elif args.mode == "offset":
-            luts.append(offset_lut(q_warm[i][1], q_cool[i][1], args.strength))
-        else:
-            luts.append(quantile_lut(q_warm[i], q_cool[i],
-                                     args.strength, args.slope_min, args.slope_max))
-    if luts[0] is not None:
-        lut = luts[len(luts) // 2]
-        print("LUT(中带, 强度%.2f) in->out: %s"
-              % (args.strength, "  ".join("%d->%s" % (v, np.round(lut[v], 0).tolist())
-                                          for v in (32, 96, 160, 224))))
+    if confirmed:
+        show(confirmed, "确认为拼接条纹（同一经度被多个块支撑）")
+    elif not suspect:
+        print("没有发现贯穿全高的竖直台阶（全部 %d 个文件都干净）" % len(files))
+    if suspect:
+        show(suspect, "疑似（仅单块命中；实测云影/地物边界也能到 40+ 灰阶，靠单块分不开，"
+                      "故默认不自动修）")
 
-    # ---- 3. 校正权重：以"逐带跟踪到的接缝线"为界（硬切 + 几米抗锯齿），
-    #         西侧的衰减距离按米算，保证跨块连续 ----
-    full_px_g = args.full_m / g["m_per_px"]
-    ramp_px_g = args.ramp_m / g["m_per_px"]
-    aa_px = max(2.0, args.aa_m / g["m_per_px"])
+    # ---- 2. 按经线聚组：一个 Google 补丁边界常常横跨多个块 ----
+    if not groups:
+        print("\n没有需要处理的拼接边界。")
+        return
+    print("\n== 拼接边界分组（同一经线跨块）==")
+    usable = []
+    for i, d in enumerate(groups, 1):
+        ok = args.seam_lon is not None or d["support"] >= args.fix_min_support
+        print("  #%d  lon=%.7f  强度 %5.1f  支撑 %d 块  校正 %s  参考 %s  信号 %s (R-G %+.1f)%s"
+              % (i, d["lon"], d["severity"], d["support"], fmt_side(d["side"]),
+                 os.path.basename(d["ref"]) if d["ref"] else "自动挑选", d["sig"], d["rg_step"],
+                 "" if ok else "   <- 支撑 < %d，只报告不自动修" % args.fix_min_support))
+        if ok:
+            usable.append(d)
+    if not usable:
+        print("\n没有达到自动修复门槛（支撑 >= %d）的拼接边界；可加 --fix-min-support 放宽，"
+              "或用 --seam-lon 手工指定经度。" % args.fix_min_support)
+        return
+    groups = usable
+
+    # ---- 3. 修复计划：参考块 -> 逐带锚点 -> LUT；哪些块要挨哪几刀 ----
+    plan = plan_group(groups, args, files)
+    if not plan:
+        print("\n检出的条纹证据不足，未生成修复计划（可用 --seam-lon 手工指定经度）。")
+        return
+    for i, p in enumerate(plan, 1):
+        p["id"] = i
+        print("\n  计划 #%d  lon=%.7f  参考块 %s（接缝对比度 %.1f 灰阶，块内游走 %.0f px / %.0f m）"
+              % (i, p["lon"], os.path.basename(p["ref"]), p["score"],
+                 p["wander"], p["wander"] * p["m_per_px"]))
+        print("    校正侧 %s，接缝在参考块内 x=%d px，%d 个纬度带"
+              % (fmt_side(p["side"]), p["ref_x"], len(p["luts"])))
+        if p["luts"] and p["luts"][0] is not None:
+            lut = p["luts"][len(p["luts"]) // 2]
+            print("    LUT(中带, 强度 %.2f) in->out: %s"
+                  % (args.strength, "  ".join("%d->%s" % (v, np.round(lut[v], 0).tolist())
+                                              for v in (32, 96, 160, 224))))
+        print("    黄侧 带0 p10/50/90: %s" % np.round(p["q_warm"][0], 0).tolist())
+        print("    绿侧 带0 p10/50/90: %s" % np.round(p["q_cool"][0], 0).tolist())
+
     reach_m = args.full_m + args.ramp_m
-
-    done = 0
+    todo, skipped = [], []
     for f in files:
-        gg = block_geo(f)
-        if gg is not None and gg["lon_right"] < lon_seam - reach_m / m_per_deg_lon(lat_mid):
-            continue                                   # 整块在补丁之外，不动
+        aff = groups_for_file(f, plan, reach_m, lat_mid)
+        (todo if aff else skipped).append((f, aff))
+    print("\n== 修复计划：文件清单 ==")
+    for f, aff in todo:
+        print("  改  %-34s <- %s" % (os.path.basename(f),
+                                     "、".join("#%d(lon=%.7f)" % (p["id"], p["lon"]) for p in aff)))
+    if skipped:
+        print("  跳过 %d 个文件（不在任何边界西侧 %d m 内）：%s"
+              % (len(skipped), int(reach_m),
+                 ", ".join(os.path.basename(f) for f, _ in skipped[:6]) +
+                 (" ..." if len(skipped) > 6 else "")))
+
+    if args.scan or not args.write_dds:
+        print("\n只扫描未改动文件。加 --write 执行修复（--out-dir 换目录，否则原地并留 .bak）。")
+        return
+
+    # ---- 4. 执行 ----
+    print("\n== 修复 ==")
+    done = 0
+    for f, aff in todo:
         img = load_rgb(f)
-        h, w, _ = img.shape
-        gg = block_geo(f, w)
-        seed = lon_to_px(f, lon_seam, w)
-        contains = -64 <= seed <= w + 64
-
-        if contains:
-            # 逐带跟踪这条线 -> 插值成逐行位置
-            seam_bands = track_seam(img, seed, search=args.search_px, band_rows=args.band)
-            centres = (np.arange(len(seam_bands)) + 0.5) * args.band
-            seam_rows = np.interp(np.arange(h), centres, seam_bands).astype(np.float32)
-            dist_px = seam_rows[:, None] - np.arange(w, dtype=np.float32)[None, :]   # >0 在西(黄)侧
-        else:
-            # 整块都在这条线以西：按经度算距离（此时距离单调，不需要跟踪）
-            lons = gg["lon_left"] + np.arange(w, dtype=np.float32) / gg["px_per_deg"]
-            dist_px = np.broadcast_to(((lon_seam - lons) * gg["px_per_deg"])[None, :], (h, w)).copy()
-
-        weight = np.clip(np.where(dist_px > full_px_g,
-                                  np.clip((full_px_g + ramp_px_g - dist_px) / ramp_px_g, 0, 1),
-                                  1.0), 0, 1)
-        weight = np.where(dist_px < 0.0, 0.0, weight)             # 另一侧完全不动
-        weight = np.where(np.abs(dist_px) < aa_px,                # 接缝几米抗锯齿
-                          np.clip(0.5 + dist_px / (2 * aa_px), 0, 1), weight).astype(np.float32)
-        if warm_side == "right":
-            weight = 1.0 - weight
-
-        if args.mode == "identity":
-            r_px = int(max(8, round(2 * args.ramp_m / gg["m_per_px"])))
-            band = np.abs(np.asarray(dist_px, dtype=np.float32)) < ramp_px_g
-            out = img
-            if band.any():
-                box = np.ones(r_px) / r_px
-                sm = np.empty_like(img)
-                for c in range(3):
-                    sm[:, :, c] = np.apply_along_axis(
-                        lambda r: np.convolve(np.pad(r, (r_px // 2, r_px // 2), mode="edge"), box, "valid"),
-                        1, img[:, :, c])
-                out = np.where(band[:, :, None], sm, img)
-        else:
-            corrected = apply_lut_rows(img, luts, args.band)
-            out = img * (1.0 - weight[:, :, None]) + corrected * weight[:, :, None]
-
-        sx_px = int(seed) if contains else w            # 块内没有这条线时，用整块均值做参考
-        b_step, a_step = step_across(img, sx_px), step_across(out, sx_px)
-        print("[%s] 跨缝 Δ(R-G): %s -> %s   校正权重均值 %.0f%%%s"
-              % (os.path.basename(f), fmt(b_step), fmt(a_step), 100 * weight.mean(),
-                 "" if contains else "   （此块全在接缝以西）"))
-
+        cur = img
+        lines = []
+        for p in aff:
+            cur, weight, contains, seed = apply_group_to_image(cur, f, p, args)
+            sx = int(seed) if contains else img.shape[1]
+            lines.append("[%s] #%d 跨缝 Δ(R-G): %s -> %s   校正权重均值 %.0f%%%s"
+                         % (os.path.basename(f), p["id"], fmt(step_across(img, sx)),
+                            fmt(step_across(cur, sx)), 100 * weight.mean(),
+                            "" if contains else "   （此块全在接缝以西）"))
+        out = np.clip(cur, 0, 255)
+        for ln in lines:
+            print(ln)
         if args.preview:
-            p = args.preview if len(files) == 1 else os.path.join(
+            pp = args.preview if len(files) == 1 else os.path.join(
                 os.path.dirname(args.preview), os.path.basename(f)[:-4] + "_prev.png")
-            make_preview(img, out, sx_px, p)
-        if args.write_dds:
-            out_u8 = np.clip(out, 0, 255).astype(np.uint8)
-            if args.out_dir:
-                # 同名同扩展名，只是换个目录
-                os.makedirs(args.out_dir, exist_ok=True)
-                dst = os.path.join(args.out_dir, os.path.basename(f))
-            else:
-                dst = f
-                if not os.path.exists(f + ".bak"):
-                    shutil.copy2(f, f + ".bak")
-            save_like(out_u8, dst, jpeg_quality=args.jpeg_quality, nvcompress=args.nvcompress, fast=args.fast)
+            make_preview(img, out, int(lon_to_px(f, plan[0]["lon"], img.shape[1])), pp)
+        out_u8 = out.astype(np.uint8)
+        if args.out_dir:
+            os.makedirs(args.out_dir, exist_ok=True)
+            dst = os.path.join(args.out_dir, os.path.basename(f))   # 同名同扩展名
+        else:
+            dst = f
+            if not os.path.exists(f + ".bak"):
+                shutil.copy2(f, f + ".bak")
+        save_like(out_u8, dst, jpeg_quality=args.jpeg_quality,
+                  nvcompress=args.nvcompress, fast=args.fast)
         done += 1
-    print("处理 %d 个文件（扩展名/格式不变）%s"
+    print("\n处理 %d 个文件（扩展名/格式不变）%s"
           % (done, "，输出目录 %s" % args.out_dir if args.out_dir else "，原文件已备份为 .bak"))
 
 
