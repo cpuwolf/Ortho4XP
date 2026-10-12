@@ -56,6 +56,11 @@ fix_google_seam.py — 修掉 Google(GO2) 影像拼接补丁留下的"黄条纹 
     # 只扫描列出（不改文件）：哪些块有条纹、在哪一列、多少灰阶、几块支撑
     python3 install/fix_google_seam.py --dir ".../zOrtho4XP_+27+089/textures" --scan
 
+    # 扫描 + 导出可排序 HTML 报告（内嵌预览图：整块缩略图 + 缝附近全分辨率裁切，点图放大）
+    python3 install/fix_google_seam.py --dir ".../textures" --scan \
+        --export-html scan.html --export-csv scan.csv
+    # 预览图太多/不想内嵌时：--no-thumbs / --thumb-max 200 / --thumb-px 512 / --thumb-q 75
+
     # 扫描 + 自动修（--out-dir 换目录；不给则原地并留 .bak）
     python3 install/fix_google_seam.py --dir ".../Orthophotos/+27+089/GO2_19" --recursive \
         --write --out-dir /tmp/fixed
@@ -71,13 +76,18 @@ fix_google_seam.py — 修掉 Google(GO2) 影像拼接补丁留下的"黄条纹 
     python3 install/fix_google_seam.py --in x.jpg --mode identity --ramp-m 400
 """
 import argparse
+import base64
+import collections
 import glob
+import html as html_mod
+import io
 import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))   # realpath: 软链/别名也能定位到真实位置
 
@@ -99,7 +109,7 @@ ORTHO_ROOT = _find_ortho_root(HERE) or _find_ortho_root(os.getcwd())
 
 try:
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except ImportError as exc:
     sys.exit("缺少依赖：%s\n"
              "用与 Ortho4XP 相同的解释器运行（Ortho4XP 本身就依赖 pillow/numpy），或者：\n"
@@ -722,6 +732,325 @@ def fmt_side(s):
     return "西侧" if s == "left" else "东侧"
 
 
+def _h(x):
+    return html_mod.escape(str(x))
+
+
+def write_scan_csv(path, rep):
+    """机器可读清单：所有候选条纹 + 分组 + 修复计划。UTF-8 BOM，Excel 直接开。"""
+    import csv as _csv
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        wr = _csv.writer(fh)
+        wr.writerow(["类别", "文件", "位置x", "向西距离m", "经度", "校正侧", "信号",
+                     "R-G台阶", "强度", "同向性", "块数支撑", "分组经度"])
+        for r in rep["rows"]:
+            wr.writerow(["确认" if r["confirmed"] else "疑似", r["file"], r["x"],
+                         "%.0f" % r["px_m"], "%.7f" % r["lon"], r["side"], r["sig"],
+                         "%.1f" % r["rg"], "%.1f" % r["sev"],
+                         ("%.0f%%" % (100 * r["coh"])) if r.get("coh") is not None else "",
+                         r["support"],
+                         "%.7f" % r["group"] if r["group"] is not None else ""])
+        for i, d in enumerate(rep["groups"], 1):
+            wr.writerow(["分组#%d" % i, os.path.basename(d["ref"] or ""), "", "",
+                         "%.7f" % d["lon"], "", d["sig"], "%.1f" % d["rg_step"],
+                         "%.1f" % d["severity"], d["support"], "%.7f" % d["lon"]])
+        for name, ids in rep["todo"]:
+            wr.writerow(["待修", name, "", "", "", "", "", "", "", "", ids])
+
+
+def _jpeg_b64(im, quality=75):
+    """PIL 图 -> base64 JPEG 字符串（内嵌进 HTML，报告单文件自带预览）。"""
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=int(quality), optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def line_coherence(arr, x, band=256, p_lo=32, p_hi=96):
+    """这条 x 到底算不算"贯穿全高的竖直台阶"：逐带台阶同向比例。
+
+    实测：真接缝 75-100%（每一带的色调跳变方向一致）；把地物/噪声当条纹时只有
+    14-20%（带与带之间台阶方向来回翻）。所以这是判断"是不是一条线"的硬指标，
+    比强度本身可靠——强度只看带间中位数，噪声也能凑出十几灰阶。
+    返回 (同向比例, 逐带台阶中位数)。
+    """
+    h, w, _ = arr.shape
+    n = h // band
+    if n < 2 or w < 2 * p_hi:
+        return 0.0, 0.0
+    rg = arr[:n * band, :, 0].astype(np.float32) - arr[:n * band, :, 1].astype(np.float32)
+    left = rg[:, max(0, x - p_hi):max(1, x - p_lo)].mean(axis=1)
+    right = rg[:, min(w, x + p_lo):min(w, x + p_hi)].mean(axis=1)
+    s = (right - left).reshape(n, band)
+    per_band = np.median(s, axis=1)
+    v = per_band[np.abs(per_band) > 2.0]
+    if v.size == 0:
+        return 0.0, 0.0
+    return abs(float(np.mean(np.sign(v)))), float(np.median(np.abs(v)))
+
+
+def preview_crops(path, xs_full, block=4096, thumb_px=320, detail_px=448, quality=72):
+    """一次解码，给同一文件的多个候选位置各出两张预览：
+
+      · 整块缩略图：一眼看出这条线在哪、走向如何；
+      · 缝附近全分辨率裁切（纵向取块中部）：看清台阶是硬边（拼接线）还是软过渡（云影/地物）。
+    两张都画一条 2px 红线标出算法认定的接缝位置。顺带在全分辨率上量"逐带同向性"。
+
+    返回 {x_full: (缩略图 base64, 裁切图 base64, 同向性, 台阶中位数)}；打不开的文件返回 {}。
+    """
+    out = {}
+    try:
+        with Image.open(path) as im0:
+            im = im0.convert("RGB")
+        arr = np.asarray(im)
+        w, h = im.size
+        t = im.resize((thumb_px, thumb_px), Image.Resampling.LANCZOS)
+        dt = ImageDraw.Draw(t)
+        half = detail_px // 2
+        for xf in sorted(set(int(x) for x in xs_full)):
+            xs = max(0, min(w - 1, int(round(xf * w / float(block)))))
+            tx = int(round(xs * thumb_px / float(w)))
+            dt.line([(tx, 0), (tx, thumb_px)], fill=(255, 0, 0), width=2)
+            left = max(0, min(max(0, w - detail_px), xs - half)) if w > detail_px else 0
+            top = max(0, (h - detail_px) // 2)
+            c = im.crop((left, top, left + min(detail_px, w), top + min(detail_px, h)))
+            ImageDraw.Draw(c).line([(xs - left, 0), (xs - left, c.size[1])],
+                                   fill=(255, 0, 0), width=2)
+            coh, mag = line_coherence(arr, xs)
+            out[xf] = (_jpeg_b64(t.copy(), quality), _jpeg_b64(c, quality), coh, mag)
+    except Exception as e:                                   # 预览失败不该毁掉整个报告
+        sys.stderr.write("预览生成失败 %s: %s\n" % (os.path.basename(path), e))
+        return {}
+    return out
+
+
+def write_scan_html(path, rep):
+    """白色底的独立 HTML 报告：确认条纹 / 疑似 / 分组 / 修复计划 / 修复结果。
+
+    每条候选都内嵌两张预览图（整块缩略图 + 缝附近全分辨率裁切，红线标位置），
+    点图放大。表头可点击排序。单文件自带，不依赖外部资源。
+    """
+    m = rep["meta"]
+    zooms = "、".join("ZL%s×%d" % (z, n) for z, n in sorted(m["zooms"].items(), reverse=True))
+
+    def table(cols, rows, cls=""):
+        if not rows:
+            return "<p class=\"none\">（无）</p>"
+        th = "".join('<th onclick="srt(this,%d)">%s</th>' % (i, _h(c)) for i, c in enumerate(cols))
+        body = []
+        for r in rows:
+            tds = []
+            for c in r:
+                if isinstance(c, tuple):
+                    if c[0] is None:                        # 已经是整段 HTML（如预览图）
+                        tds.append(c[1])
+                    else:
+                        tds.append("<td%s>%s</td>" % (c[1], _h(c[0])))
+                else:
+                    tds.append("<td>%s</td>" % _h(c))
+            body.append("<tr>%s</tr>" % "".join(tds))
+        return ('<table class="%s"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>'
+                % (cls, th, "".join(body)))
+
+    conf = [r for r in rep["rows"] if r["confirmed"]]
+    susp = [r for r in rep["rows"] if not r["confirmed"]]
+
+    # ---- 预览图：每个候选两张（整块缩略图 + 缝附近全分辨率裁切），按文件一次解码 ----
+    # 同时在全分辨率上量"逐带同向性"——这是判断"到底是不是一条线"的硬指标。
+    pv = {}
+    if m.get("thumbs", True) and rep["rows"]:
+        by_file = {}
+        keep = sorted(rep["rows"], key=lambda r: -r["sev"])[:m["thumb_max"]]
+        for r in keep:
+            if r.get("path"):
+                by_file.setdefault(r["path"], []).append(r["x"])
+        for p, xs in by_file.items():
+            pv[p] = preview_crops(p, xs, thumb_px=m["thumb_px"], detail_px=m["detail_px"],
+                                  quality=m["thumb_q"])
+        got = sum(len(v) for v in pv.values())
+        print("  预览图：%d 个文件 / %d 条候选（点图放大）%s"
+              % (len(pv), got, "" if got >= len(rep["rows"]) else
+                 "；仅前 %d 条（--thumb-max 可调）" % m["thumb_max"]))
+
+    # 用实测同向性重判"确认/疑似"：跨块支撑是必要条件，同向性是被测出来的充分性。
+    reclass = 0
+    for r in rep["rows"]:
+        t = pv.get(r.get("path") or "", {}).get(r["x"])
+        r["coh"] = t[2] if t else None
+        r["coh_mag"] = t[3] if t else None
+        if r["coh"] is not None:
+            was = r["confirmed"]
+            r["confirmed"] = bool(r["confirmed"] and r["coh"] >= m["min_coh"])
+            if was and not r["confirmed"]:
+                reclass += 1
+    if reclass:
+        print("  同向性复核：%d 条原判\"确认\"因逐带方向不一致改判为疑似"
+              "（同向性 < %.0f%%）" % (reclass, 100 * m["min_coh"]))
+    conf = [r for r in rep["rows"] if r["confirmed"]]
+    susp = [r for r in rep["rows"] if not r["confirmed"]]
+
+    qa_cols = (["预览"] if pv else []) + [
+        "强度", "同向性", "文件", "位置 x", "向西距离(m)", "经度", "校正侧", "信号",
+        "R-G 台阶", "块数支撑"]
+
+    def qa_rows(rs):
+        rows = []
+        for r in sorted(rs, key=lambda r: -r["sev"]):
+            cells = []
+            if pv:
+                t = pv.get(r.get("path") or "", {}).get(r["x"])
+                if t:
+                    cells.append((None, '<td class="pv">'
+                                  '<img class="t" width="176" title="整块（红线=接缝位置）" alt="整块" '
+                                  'src="data:image/jpeg;base64,%s" onclick="big(this)">'
+                                  '<img class="d" width="176" title="缝附近全分辨率" alt="缝附近" '
+                                  'src="data:image/jpeg;base64,%s" onclick="big(this)">'
+                                  '</td>' % (t[0], t[1])))
+                else:
+                    cells.append("—")
+            coh = "—" if r["coh"] is None else "%.0f%%" % (100 * r["coh"])
+            cells += [("%.1f" % r["sev"]), coh, r["file"], r["x"], "%.0f" % r["px_m"],
+                      "%.7f" % r["lon"], r["side"], r["sig"], "%+.1f" % r["rg"],
+                      (r["support"] if r["confirmed"] else "—")]
+            rows.append(cells)
+        return rows
+
+    grp_rows = []
+    for i, d in enumerate(rep["groups"], 1):
+        ok = rep["fix_ids"].get(i, False)
+        grp_rows.append(["#%d" % i, "%.7f" % d["lon"], "%.1f" % d["severity"], d["support"],
+                         "西侧" if d["side"] == "left" else "东侧", d["sig"],
+                         "%+.1f" % d["rg_step"], os.path.basename(d["ref"] or ""),
+                         ("自动修" if ok else "只报告"),
+                         ("%.0f" % d["wander_m"]) if ok and d.get("wander_m") is not None else "—"])
+
+    todo_rows = [[n, ids] for n, ids in rep["todo"]]
+    fix_rows = [[r["file"], r["before"], r["after"], r["weight"]] for r in rep["fixed"]]
+
+    parts = []
+    parts.append("""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Google 影像拼接条纹扫描报告</title>
+<style>
+ body{background:#ffffff;color:#1a1a1a;font:14px/1.6 -apple-system,"Helvetica Neue",
+      "PingFang SC",sans-serif;margin:0;padding:28px 32px;}
+ h1{font-size:20px;margin:0 0 4px;} h2{font-size:15px;margin:26px 0 8px;
+      padding-bottom:5px;border-bottom:1px solid #e2e2e2;}
+ .sub{color:#666;font-size:12.5px;margin-bottom:18px;}
+ .meta{background:#fafafa;border:1px solid #e6e6e6;border-radius:6px;padding:12px 16px;
+      font-size:13px;margin-bottom:6px;}
+ .meta b{color:#111;} .meta span{margin-right:26px;white-space:nowrap;display:inline-block;}
+ table{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px;}
+ th{background:#f4f4f4;border:1px solid #e0e0e0;padding:6px 8px;text-align:left;
+      cursor:pointer;user-select:none;white-space:nowrap;font-weight:600;}
+ th:hover{background:#ececec;} th:after{content:" ⇅";color:#bbb;font-weight:400;}
+ td{border:1px solid #e6e6e6;padding:5px 8px;white-space:nowrap;}
+ tbody tr:nth-child(even){background:#fbfbfb;}
+ td:last-child{white-space:normal;}
+ .none{color:#888;font-size:13px;margin:6px 0 0;}
+ .warn{background:#fff8e6;border-left:3px solid #e0a800;padding:10px 14px;border-radius:4px;
+      font-size:13px;margin-top:8px;}
+ .ok{background:#f1f8f2;border-left:3px solid #2e7d32;padding:10px 14px;border-radius:4px;
+      font-size:13px;margin-top:8px;}
+ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;
+      font:12.5px ui-monospace,Menlo,monospace;}
+ .sig-rg{color:#0b6b3a;font-weight:600;} .sig-y{color:#8a6d00;}
+ td.pv{padding:3px;background:#fff;white-space:nowrap;} td.pv img{display:inline-block;
+      vertical-align:top;border:1px solid #ddd;border-radius:3px;cursor:zoom-in;}
+ td.pv img.t{margin-right:3px;}
+ #ov{display:none;position:fixed;inset:0;background:rgba(20,20,20,.82);z-index:9;
+      align-items:center;justify-content:center;cursor:zoom-out;}
+ #ov img{max-width:96vw;max-height:94vh;background:#fff;border-radius:4px;}
+ #ov span{position:fixed;top:14px;right:22px;color:#fff;font-size:26px;cursor:pointer;
+      line-height:1;}
+ footer{color:#888;font-size:12px;margin-top:26px;border-top:1px solid #e6e6e6;padding-top:10px;}
+</style></head><body>
+<h1>Google 影像拼接条纹扫描报告</h1>
+<div class="sub">Ortho4XP 地景切片 · GO2 卫星影像马赛克补丁边界检测（只读扫描，未改动任何文件）</div>""")
+
+    parts.append('<div class="meta"><span><b>目录</b> %s</span><span><b>文件</b> %d（%s）</span>'
+                 '<span><b>zoom</b> %s</span><br style="line-height:2">'
+                 '<span><b>阈值</b> ≥%.1f 灰阶</span><span><b>聚组容差</b> %d px</span>'
+                 '<span><b>列表门槛</b> ≥%d 块</span><span><b>自动修门槛</b> ≥%d 块</span>'
+                 '<span><b>接缝游走上限</b> %.0f m</span>'
+                 '<span><b>扫描时间</b> %s</span></div>'
+                 % (_h(m["src"]), m["n_files"], _h(m["exts"]), _h(zooms), m["min_step"],
+                    m["group_px"], m["min_support"], m["fix_min_support"],
+                    m["max_wander_m"], _h(m["time"])))
+
+    parts.append('<h2>① 确认为拼接条纹（同一经度被多个块支撑）%d 处</h2>' % len(conf))
+    parts.append('''<div class="warn"><b>判据：跨块支撑。</b>单块图像上，Google 补丁边界与云影/地物
+边界几乎无法区分（实测云影台阶可达 43 灰阶，和真接缝的 28 灰阶一样陡）。只有
+「同一条经线被多个块同时命中」才是可靠证据。信号 <span class="sig-rg">rg</span> = R−G 色偏跳变，
+<span class="sig-y">y</span> = 亮度跳变。R−G 台阶是这条线的色偏分量。<br>
+<b>同向性</b> = 逐带（每 256 行）台阶方向一致的比例，在全分辨率上实测：真接缝 <b>75–100%</b>，
+噪声/地物凑出来的假线 <b>&lt;35%</b>（带与带之间方向来回翻）。判定「确认」要求跨块支撑
+<b>且</b> 同向性 ≥ __MINCOH__%。<br>
+<b>看预览图判断：</b>每行两张 —— 左 = 整块缩略图（红线 = 算法认定的接缝位置，看它落在哪、
+走向如何），右 = 缝附近的全分辨率裁切（看台阶是硬边还是软过渡）。点任意一张放大。<br>
+硬边、两侧纹理连续但色调/色偏跳变 = 拼接线；软过渡、边缘跟着地形地物走 = 云影或地物边。</div>'''.replace(
+        "__MINCOH__", "%.0f" % (100 * m["min_coh"])))
+    parts.append(table(qa_cols, qa_rows(conf)))
+
+    parts.append('<h2>② 疑似（仅单块命中，未自动修复）%d 处</h2>' % len(susp))
+    parts.append('<p class="sub" style="margin:6px 0 0">这些也可能是真接缝（补丁角点可能落在一块内），'
+                 '但也可能是云影边界、地物边缘。要修的话用 <code>--seam-lon &lt;经度&gt;</code> 手工指定。</p>')
+    parts.append(table(qa_cols, qa_rows(susp)))
+
+    parts.append('<h2>③ 分组（同一经线跨块）%d 组</h2>' % len(rep["groups"]))
+    parts.append(table(["组", "经度", "强度", "块数支撑", "被校正侧", "信号", "R-G 台阶",
+                        "参考块", "处置", "参考块内游走(m)"], grp_rows))
+
+    parts.append('<h2>④ 修复计划：文件清单（%d 个）</h2>' % len(todo_rows))
+    parts.append('<p class="sub" style="margin:6px 0 0">受影响 = 该块含这条经线，'
+                 '或该块在它西侧且东缘到它的距离小于衰减范围（%d m）。东侧的块权重恒为 0，一律不动。</p>'
+                 % m["reach_m"])
+    parts.append(table(["文件", "挨哪几刀"], todo_rows))
+
+    if fix_rows:
+        parts.append('<h2>⑤ 修复结果（跨缝 Δ(R−G)，灰阶）</h2>')
+        parts.append(table(["文件", "修复前", "修复后", "校正权重均值"], fix_rows))
+    else:
+        parts.append('<h2>⑤ 修复结果</h2><p class="none">本次为只读扫描，未写入文件。'
+                     '加 <code>--write</code> 才会执行。</p>')
+
+    parts.append('''<h2>⑥ 说明与已知边界</h2>
+<div class="meta" style="line-height:1.9">
+· <b>不改格式</b>：输出保持原扩展名原格式（jpg→同名 jpg，dds→同名 dds 走同一条
+  <code>nvcompress -bc1</code>），不做格式转换。<br>
+· <b>不碰原文件</b>：给了 <code>--out-dir</code> 就写那里；否则原地写并把原文件备份成
+  <code>.bak</code>。<br>
+· <b>只信跨块</b>：见 ①。单块命中的一律只列不修，避免把云影边界当接缝改掉。<br>
+· <b>低 ZL 填充块</b>：ZL13/15/16 块一个像素几米到十几米、窗口覆盖好几公里，估出的 tone
+  LUT 与全分辨率块不是一回事，所以参考块只从「该组里 zoom 最高」的块里挑。<br>
+· <b>接缝游走</b>：参考块里那条线自身游走超过 %.0f m，判定为云影/地物边，跳过不修。<br>
+· <b>校正量幅度不等于错</b>：真实接缝的逐带校正量能到 70+ 灰阶（分位对分位匹配后还要乘
+  权重，实际生效量约 1/3），所以幅度只提示不拦。<br>
+· <b>建议流程</b>：先看本报告 → 挑出要修的经度 → <code>--seam-lon</code> 或默认自动 → 加
+  <code>--preview</code> 看一张 → 再加 <code>--write</code>。
+</div>
+<footer>由 Ortho4XP <code>install/fix_google_seam.py</code> 生成 · 点表头可排序 · 点预览图放大</footer>
+<div id="ov" onclick="this.style.display='none'"><span>×</span><img alt="放大预览" src=""></div>
+<script>
+function big(el){var im=el;
+ if(el.classList.contains('t')&&el.nextElementSibling)im=el.nextElementSibling;   /* 缩略图 -> 用同行的缝附近图 */
+ var o=document.getElementById('ov');
+ o.querySelector('img').src=im.src;o.style.display='flex';}
+function srt(th,ci){var tb=th.closest('table').tBodies[0],rs=[].slice.call(tb.rows);
+ var d=th.dataset.d==='1'?-1:1;th.dataset.d=th.dataset.d==='1'?'0':'1';
+ rs.sort(function(a,b){var x=a.cells[ci].innerText.trim(),y=b.cells[ci].innerText.trim();
+ var nx=parseFloat(x.replace(/[^\\d.eE+-]/g,'')),ny=parseFloat(y.replace(/[^\\d.eE+-]/g,''));
+ if(isFinite(nx)&&isFinite(ny))return d*(nx-ny);
+ return d*x.localeCompare(y,'zh');});
+ rs.forEach(function(r){tb.appendChild(r);});}
+</script>
+</body></html>''' % m["max_wander_m"])
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(parts))
+    print("  扫描报告：%s" % path)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="扫描并修掉 Google(GO2) 影像拼接造成的竖直黄条纹 / 色调台阶")
@@ -747,6 +1076,19 @@ def main():
                     help="列为\"确认条纹\"所需的最少块数支撑（1 块的疑似只报告不修）")
     ap.add_argument("--fix-min-support", type=int, default=3,
                     help="自动修复所需的最少块数支撑；比列表阈值更严，避免把长的云影边界当接缝改掉")
+    ap.add_argument("--export-html", metavar="PATH",
+                    help="把扫描结果导出成可排序的 HTML 报告（白色底，内嵌预览图）")
+    ap.add_argument("--export-csv", metavar="PATH",
+                    help="把扫描结果导出成 CSV（UTF-8 BOM，Excel 直接开）")
+    ap.add_argument("--no-thumbs", action="store_true",
+                    help="HTML 报告不内嵌预览图（默认内嵌：整块缩略图 + 缝附近全分辨率裁切）")
+    ap.add_argument("--thumb-px", type=int, default=320, help="整块缩略图边长(px)")
+    ap.add_argument("--detail-px", type=int, default=448, help="缝附近全分辨率裁切图边长(px)")
+    ap.add_argument("--thumb-q", type=int, default=72, help="预览图 JPEG 质量(1-95)")
+    ap.add_argument("--min-coh", type=float, default=0.5,
+                    help="判定\"确实是一条线\"所需的逐带同向性（真接缝实测 75-100%%，噪声 <35%%）")
+    ap.add_argument("--thumb-max", type=int, default=200,
+                    help="最多内嵌多少条候选的预览图（按强度排序取前 N，防止目录巨大时报告爆掉）")
     ap.add_argument("--max-wander-m", type=float, default=400.0,
                     help="参考块内接缝游走上限(米)；超过判定为云影/地物边，不修")
     ap.add_argument("--max-lut-shift", type=float, default=60.0,
@@ -808,9 +1150,37 @@ def main():
         return None
 
     confirmed, suspect = [], []
+    rows = []
     for f, cands in scanned:
-        for c in cands:
-            (confirmed if confirmed_lon(f, c[0]) else suspect).append((f, c))
+        g = geo_cache.get(f)
+        for (x, sev, side, sig, rg) in cands:
+            d = confirmed_lon(f, x)
+            (confirmed if d else suspect).append((f, (x, sev, side, sig, rg)))
+            rows.append(dict(file=os.path.basename(f), path=f, x=int(x),
+                             px_m=(x * g["m_per_px"]) if g else 0.0,
+                             lon=px_to_lon(f, x) if g else float("nan"),
+                             side=fmt_side(side), sig=sig, rg=float(rg), sev=float(sev),
+                             support=int(d["support"]) if d else 0,
+                             group=(d["lon"] if d else None), confirmed=bool(d)))
+
+    rep: dict = dict(meta=dict(src=os.path.abspath(args.folder or os.path.dirname(files[0])),
+                         n_files=len(files), exts="/".join(exts),
+                         zooms=collections.Counter((block_geo(f) or {}).get("zl", 0)
+                                                   for f in files),
+                         min_step=args.min_step, group_px=args.group_px,
+                         min_support=args.min_support, fix_min_support=args.fix_min_support,
+                         max_wander_m=args.max_wander_m, reach_m=int(args.full_m + args.ramp_m),
+                         thumbs=not args.no_thumbs, thumb_px=args.thumb_px,
+                         detail_px=args.detail_px, thumb_q=args.thumb_q,
+                         min_coh=args.min_coh, thumb_max=args.thumb_max,
+                         time=time.strftime("%Y-%m-%d %H:%M:%S")),
+               rows=rows, groups=[], plan=[], todo=[], fixed=[], fix_ids={})
+
+    def emit():
+        if args.export_html:
+            write_scan_html(args.export_html, rep)
+        if args.export_csv:
+            write_scan_csv(args.export_csv, rep)
 
     def show(rows, tag):
         if not rows:
@@ -836,13 +1206,16 @@ def main():
                       "故默认不自动修）")
 
     # ---- 2. 按经线聚组：一个 Google 补丁边界常常横跨多个块 ----
+    rep["groups"] = groups
     if not groups:
         print("\n没有需要处理的拼接边界。")
+        emit()
         return
     print("\n== 拼接边界分组（同一经线跨块）==")
     usable = []
     for i, d in enumerate(groups, 1):
         ok = args.seam_lon is not None or d["support"] >= args.fix_min_support
+        rep["fix_ids"][i] = bool(ok)
         print("  #%d  lon=%.7f  强度 %5.1f  支撑 %d 块  校正 %s  参考 %s  信号 %s (R-G %+.1f)%s"
               % (i, d["lon"], d["severity"], d["support"], fmt_side(d["side"]),
                  os.path.basename(d["ref"]) if d["ref"] else "自动挑选", d["sig"], d["rg_step"],
@@ -852,6 +1225,7 @@ def main():
     if not usable:
         print("\n没有达到自动修复门槛（支撑 >= %d）的拼接边界；可加 --fix-min-support 放宽，"
               "或用 --seam-lon 手工指定经度。" % args.fix_min_support)
+        emit()
         return
     groups = usable
 
@@ -859,6 +1233,7 @@ def main():
     plan = plan_group(groups, args, files)
     if not plan:
         print("\n检出的条纹证据不足，未生成修复计划（可用 --seam-lon 手工指定经度）。")
+        emit()
         return
     for i, p in enumerate(plan, 1):
         p["id"] = i
@@ -889,9 +1264,14 @@ def main():
               % (len(skipped), int(reach_m),
                  ", ".join(os.path.basename(f) for f, _ in skipped[:6]) +
                  (" ..." if len(skipped) > 6 else "")))
+    rep["plan"] = plan
+    rep["todo"] = [(os.path.basename(f),
+                    "、".join("#%d(lon=%.7f)" % (p["id"], p["lon"]) for p in aff))
+                   for f, aff in todo]
 
     if args.scan or not args.write_dds:
         print("\n只扫描未改动文件。加 --write 执行修复（--out-dir 换目录，否则原地并留 .bak）。")
+        emit()
         return
 
     # ---- 4. 执行 ----
@@ -904,10 +1284,12 @@ def main():
         for p in aff:
             cur, weight, contains, seed = apply_group_to_image(cur, f, p, args)
             sx = int(seed) if contains else img.shape[1]
+            before, after = fmt(step_across(img, sx)), fmt(step_across(cur, sx))
             lines.append("[%s] #%d 跨缝 Δ(R-G): %s -> %s   校正权重均值 %.0f%%%s"
-                         % (os.path.basename(f), p["id"], fmt(step_across(img, sx)),
-                            fmt(step_across(cur, sx)), 100 * weight.mean(),
+                         % (os.path.basename(f), p["id"], before, after, 100 * weight.mean(),
                             "" if contains else "   （此块全在接缝以西）"))
+            rep["fixed"].append(dict(file=os.path.basename(f), before=before, after=after,
+                                     weight="%.0f%%" % (100 * weight.mean())))
         out = np.clip(cur, 0, 255)
         for ln in lines:
             print(ln)
@@ -928,6 +1310,7 @@ def main():
         done += 1
     print("\n处理 %d 个文件（扩展名/格式不变）%s"
           % (done, "，输出目录 %s" % args.out_dir if args.out_dir else "，原文件已备份为 .bak"))
+    emit()
 
 
 if __name__ == "__main__":
