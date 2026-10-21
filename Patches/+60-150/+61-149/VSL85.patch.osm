@@ -1,0 +1,46 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<osm version='0.6' generator='JOSM'>
+  <node id='-26140' action='modify' visible='true' lat='61.38997930159' lon='-148.35147866249' />
+  <node id='-26191' action='modify' visible='true' lat='61.38863325969' lon='-148.36759337425'>
+    <tag k='aeroway' v='aerodrome' />
+    <tag k='iata' v='VSL85' />
+    <tag k='icao' v='VSL85' />
+    <tag k='name' v='VSL Base' />
+  </node>
+  <node id='-26276' action='modify' visible='true' lat='61.39055469112' lon='-148.35851677895' />
+  <node id='-26277' action='modify' visible='true' lat='61.38923949948' lon='-148.37782868385' />
+  <node id='-26278' action='modify' visible='true' lat='61.38808866139' lon='-148.38443764687' />
+  <node id='-26279' action='modify' visible='true' lat='61.38611569749' lon='-148.39027413368' />
+  <node id='-26280' action='modify' visible='true' lat='61.38286825658' lon='-148.39370736122' />
+  <node id='-26281' action='modify' visible='true' lat='61.37941491134' lon='-148.3931065464' />
+  <node id='-26282' action='modify' visible='true' lat='61.37657794952' lon='-148.38469513893' />
+  <node id='-26283' action='modify' visible='true' lat='61.37485097716' lon='-148.38014611244' />
+  <node id='-26284' action='modify' visible='true' lat='61.37390521379' lon='-148.37044724464' />
+  <node id='-26285' action='modify' visible='true' lat='61.37365848821' lon='-148.36418160439' />
+  <node id='-26286' action='modify' visible='true' lat='61.37682465207' lon='-148.35577019691' />
+  <node id='-26287' action='modify' visible='true' lat='61.38031939577' lon='-148.34787377357' />
+  <node id='-26288' action='modify' visible='true' lat='61.38221050594' lon='-148.34401139259' />
+  <node id='-26289' action='modify' visible='true' lat='61.38796535479' lon='-148.34881791115' />
+  <node id='-26290' action='modify' visible='true' lat='61.38936280105' lon='-148.34967621803' />
+  <node id='-26291' action='modify' visible='true' lat='61.39055469112' lon='-148.35319527626' />
+  <way id='-792' action='modify' visible='true'>
+    <nd ref='-26276' />
+    <nd ref='-26277' />
+    <nd ref='-26278' />
+    <nd ref='-26279' />
+    <nd ref='-26280' />
+    <nd ref='-26281' />
+    <nd ref='-26282' />
+    <nd ref='-26283' />
+    <nd ref='-26284' />
+    <nd ref='-26285' />
+    <nd ref='-26286' />
+    <nd ref='-26287' />
+    <nd ref='-26288' />
+    <nd ref='-26289' />
+    <nd ref='-26290' />
+    <nd ref='-26291' />
+    <nd ref='-26276' />
+    <tag k='altitude' v='478' />
+  </way>
+</osm>
